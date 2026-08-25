@@ -1,22 +1,66 @@
 ﻿AHCI.R4D
 ========
 
-Projektstruktur seit 0.51.22
---------------------------------
+Version 0.2.0 ist der kanonische Preload-Besitzer fuer AHCI-Controller. Der
+Kernel verwendet seinen eingebauten Ein-Slot-Pollingpfad nur noch als Rettung,
+wenn der Preload-Treiber fehlt oder bereits kontrolliert fehlgeschlagen ist.
+Ein aktiver Preload-Treiber und der Rettungspfad greifen niemals gleichzeitig
+auf denselben Controller zu.
 
-Dieses Verzeichnis ist ein eigenstaendiges R4OS-SDK-Projekt fuer AHCI.R4D.
+Initialisierung
+---------------
 
-Build:
+Der Treiber inventarisiert alle unterstuetzten AHCI-Funktionen und alle aktiven
+SATA-Ports. Nach BIOS-Handoff und HBA-Reset erhaelt jeder geeignete Port eine
+eigene Command List, Received-FIS-Area, 16 Command Tables und einen
+IDENTIFY-Puffer. IDENTIFY DEVICE bestimmt Kapazitaet, 28-/48-Bit-LBA,
+logische Sektorgroesse von 512 bis 4096 Bytes, DMA, Schreibcache, Flush,
+NCQ und Laufwerks-Queue-Tiefe. Eine Ueberbelegung der festen acht
+Backendplaetze wird nicht still abgeschnitten, sondern verwirft das Inventar.
 
-    cd Code\System\Driver\AHCI
-    ..\..\..\DevTools\Zig\zig.exe build
+Datenpfad
+---------
 
-Artefakt:
+Die nutzbare Queue-Tiefe ist die Schnittmenge aus HBA-Slots,
+Laufwerks-Tags und dem R4OS-Limit 16. NCQ verwendet den Command-Slot als
+ATA-Tag. Ohne beidseitiges NCQ bleibt der Port bei Tiefe eins und verwendet
+READ/WRITE DMA beziehungsweise DMA EXT. Ein Request ist auf 2 MB begrenzt;
+seine gepinnte Segmentabbildung wird in hoechstens 64 PRDT-Eintraege mit je
+hoechstens 4 MB zerlegt. Flush ist gegen andere Portbefehle exklusiv.
 
-    zig-out\AHCI.R4D
+Completions werden erst angenommen, wenn sowohl PxCI als auch PxSACT den Tag
+freigegeben haben. Ein von der HBA gemeldeter PRDBC-Wert muss der kompletten
+Transfergroesse entsprechen; der bei manchen HBAs fuer erfolgreiche
+NCQ-Kommandos unveraendert bei null bleibende Wert gilt als nicht gemeldet.
+IRQs sammeln nur Portstatus und delegieren die Abnahme an kurze,
+besitzgebundene Driver-Work-Auftraege. MSI beziehungsweise INTx wird
+ausschliesslich bei der Treiberinitialisierung eingerichtet, die
+HBA-Interruptquellen bleiben waehrend des synchronen Pre-LAPIC-Bootpfads aber
+maskiert und werden erst am asynchronen Runtime-Vertrag freigeschaltet. Fehlt
+eine Route, verwendet derselbe Pfad eine endliche Pollingabnahme. Der
+synchrone Bootcallback treibt dieselbe Slot-, DMA- und Completionlogik inline.
 
-Manifest:
+Fehler und Shutdown
+-------------------
 
-    module.R4MF
+Error-FIS, Taskfile-Fehler, Linkwechsel, Timeout und aktive Cancellation
+schliessen zuerst die Aufnahme. Der Port wird gestoppt, per COMRESET
+zurueckgesetzt und erneut identifiziert. Erst bei identischer Kapazitaet und
+identischen Faehigkeiten wird er wieder geoeffnet. Scheitert die
+Portquieszenz, eskaliert der Treiber auf einen HBA-Reset; unsicheres DMA fuehrt
+zum geschlossenen beziehungsweise quarantaenisierten Backend. Jede angenommene
+Anfrage besitzt eine Generation und genau eine Abschlussmeldung.
 
-Image-Zielpfad: C:\R4OS\DRIVERS\AHCI.R4D
+Beim Shutdown wird nach geschlossener Aufnahme der Schreibcache geleert, IRQ
+und Command Engine werden gestoppt, offene Besitzer abgeschlossen und erst
+danach MSI/INTx, PCI-Busmastering und DMA-Speicher freigegeben. Der Ablauf ist
+idempotent.
+
+Build und Test
+--------------
+
+    Build.bat test
+    ./Build.sh test
+
+Das Artefakt wird unter C:\R4OS\DRIVERS\AHCI.R4D installiert. Die Buildstarter
+leiten alle Workspacepfade aus ihrem eigenen Verzeichnis und Settings.R4S ab.
