@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.2.0`
+- Version: `0.2.1`
 - Image target: `/R4OS/DRIVERS/AHCI.R4D`
 - Image scope: `slim`
 - Canonical project manifest: `module.R4MF`
@@ -12,7 +12,7 @@
 The manifest is the single source of truth for the artifact, imports, image
 target, and package metadata.
 
-Version 0.2.0 is the canonical AHCI storage owner. It identifies every
+Version 0.2.1 is the canonical AHCI storage owner. It identifies every
 supported SATA disk, derives capacity, logical sector size, transfer limits,
 NCQ support and queue depth from the HBA/drive intersection, and registers a
 version-2 asynchronous block backend. Up to 16 generation-owned command tags
@@ -28,6 +28,13 @@ Timeout, cancellation, Error-FIS and link failures close admission before a
 port reset. A successful reset re-identifies the same disk before reopening;
 otherwise an HBA reset is attempted and the backend remains closed on any
 identity or quiescence uncertainty.
+
+Initial discovery follows the hardware ordering required after an HBA reset:
+each implemented port is stopped and receives valid command-list/FIS bases,
+then FIS reception and `POD`/`SUD` are enabled while the command engine remains
+stopped. The driver waits for link presence and task-file readiness before it
+starts command processing and issues IDENTIFY. This keeps real disks behind a
+staggered-spin-up port from being discarded by a premature link-state check.
 
 ## Build
 

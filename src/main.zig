@@ -95,12 +95,14 @@ const SlotPhase = enum(u8) {
 
 const PortInitOutcome = enum(u8) {
     ready,
+    absent,
     unsupported,
     failed,
 };
 
 const SignatureOutcome = enum(u8) {
     sata,
+    absent,
     unsupported,
     timeout,
 };
@@ -344,8 +346,6 @@ fn initializeController(controller: *ControllerState, ctx: *const r4os.r4dev.Dri
     while (hardware_port < 32) : (hardware_port += 1) {
         const bit = @as(u32, 1) << @as(u5, @truncate(hardware_port));
         if ((controller.pi & bit) == 0) continue;
-        const base = portBase(hardware_port);
-        if (!ahci_state.linkReady(readPort32(controller, base, PORT_SSTS))) continue;
         if (port_count >= ports.len or controller.port_count >= controller.port_indices.len) {
             inventory_complete = false;
             return failController(controller, 4);
@@ -359,7 +359,7 @@ fn initializeController(controller: *ControllerState, ctx: *const r4os.r4dev.Dri
             .hardware_port = hardware_port,
         };
         const outcome = initializePort(controller, port, ctx);
-        if (outcome == .unsupported) {
+        if (outcome == .absent or outcome == .unsupported) {
             port.* = .{};
             continue;
         }
@@ -391,20 +391,29 @@ fn initializePort(
         port.last_error = 10;
         return .failed;
     }
-    if (!rebasePort(controller, port)) {
+    if (!preparePortForDiscovery(controller, port)) {
         port.last_error = 11;
         return .failed;
     }
     switch (waitPortSignature(controller, port)) {
         .sata => active_sata_candidates += 1,
-        .unsupported => {
+        .absent, .unsupported => |outcome| {
             if (!releaseUnsupportedPort(controller, port, ctx)) return .failed;
-            return .unsupported;
+            return if (outcome == .absent) .absent else .unsupported;
         },
         .timeout => {
             port.last_error = 16;
             return .failed;
         },
+    }
+    clearPortStatus(controller, port);
+    if (!waitPortReady(controller, portBase(port.hardware_port), INIT_TIMEOUT_MS)) {
+        port.last_error = 17;
+        return .failed;
+    }
+    if (!startCommandEngine(controller, portBase(port.hardware_port))) {
+        port.last_error = 18;
+        return .failed;
     }
     const identity = identifyDrive(controller, port) orelse {
         port.last_error = 12;
@@ -441,15 +450,17 @@ fn waitPortSignature(controller: *ControllerState, port: *PortState) SignatureOu
     const base = portBase(port.hardware_port);
     const start = ctx.tickCount();
     const timeout = ahci_state.ticksFromMilliseconds(controller.timer_hz, INIT_TIMEOUT_MS);
+    var presence_seen = false;
     while (true) {
-        const signature = readPort32(controller, base, PORT_SIG);
-        if (signature == SIG_SATA) return .sata;
-        if (signature != 0 and signature != 0xFFFF_FFFF) return .unsupported;
-        if (!ahci_state.linkReady(readPort32(controller, base, PORT_SSTS)) or
-            ahci_state.deadlineExpired(start, timeout, ctx.tickCount()))
-        {
-            return .timeout;
+        const ssts = readPort32(controller, base, PORT_SSTS);
+        presence_seen = presence_seen or ahci_state.linkDetected(ssts);
+        if (ahci_state.linkReady(ssts)) {
+            const signature = readPort32(controller, base, PORT_SIG);
+            if (signature == SIG_SATA) return .sata;
+            if (signature != 0 and signature != 0xFFFF_FFFF) return .unsupported;
         }
+        if (ahci_state.deadlineExpired(start, timeout, ctx.tickCount()))
+            return if (presence_seen) .timeout else .absent;
         ctx.waitTicks(1);
     }
 }
@@ -544,7 +555,11 @@ fn resetHba(controller: *ControllerState) bool {
     return true;
 }
 
-fn rebasePort(controller: *ControllerState, port: *PortState) bool {
+/// Programs the DMA bases and starts FIS reception while command processing
+/// remains stopped.  PxCMD.SUD/POD must be raised in this idle window: on a
+/// staggered-spin-up HBA, checking PxSSTS before this step can hide a real
+/// attached disk immediately after HBA reset.
+fn preparePortForDiscovery(controller: *ControllerState, port: *PortState) bool {
     const base = portBase(port.hardware_port);
     writePort32(controller, base, PORT_IE, 0);
     if (!stopPort(controller, base)) return false;
@@ -556,7 +571,18 @@ fn rebasePort(controller: *ControllerState, port: *PortState) bool {
     writePort32(controller, base, PORT_FB, @truncate(received_fis));
     writePort32(controller, base, PORT_FBU, @truncate(received_fis >> 32));
     clearPortStatus(controller, port);
-    return startPort(controller, base);
+    const command = readPort32(controller, base, PORT_CMD);
+    if ((command & (PORT_CMD_ST | PORT_CMD_CR | PORT_CMD_FR)) != 0) return false;
+    writePort32(controller, base, PORT_CMD, command | PORT_CMD_FRE | PORT_CMD_SUD | PORT_CMD_POD);
+    return true;
+}
+
+fn rebasePort(controller: *ControllerState, port: *PortState) bool {
+    if (!preparePortForDiscovery(controller, port)) return false;
+    const base = portBase(port.hardware_port);
+    if (!ahci_state.linkReady(readPort32(controller, base, PORT_SSTS)) or
+        !waitPortReady(controller, base, INIT_TIMEOUT_MS)) return false;
+    return startCommandEngine(controller, base);
 }
 
 fn stopPort(controller: *ControllerState, base: u64) bool {
@@ -566,12 +592,10 @@ fn stopPort(controller: *ControllerState, base: u64) bool {
     return waitPortClear(controller, base, PORT_CMD, PORT_CMD_FR, INIT_TIMEOUT_MS);
 }
 
-fn startPort(controller: *ControllerState, base: u64) bool {
-    if ((readPort32(controller, base, PORT_CMD) & (PORT_CMD_CR | PORT_CMD_FR)) != 0) return false;
-    var command = readPort32(controller, base, PORT_CMD) | PORT_CMD_FRE | PORT_CMD_SUD | PORT_CMD_POD;
-    writePort32(controller, base, PORT_CMD, command);
-    command |= PORT_CMD_ST;
-    writePort32(controller, base, PORT_CMD, command);
+fn startCommandEngine(controller: *ControllerState, base: u64) bool {
+    const command = readPort32(controller, base, PORT_CMD);
+    if ((command & (PORT_CMD_ST | PORT_CMD_CR)) != 0 or (command & PORT_CMD_FRE) == 0) return false;
+    writePort32(controller, base, PORT_CMD, command | PORT_CMD_ST);
     return true;
 }
 

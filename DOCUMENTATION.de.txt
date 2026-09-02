@@ -1,7 +1,7 @@
 ﻿AHCI.R4D
 ========
 
-Version 0.2.0 ist der kanonische Preload-Besitzer fuer AHCI-Controller. Der
+Version 0.2.1 ist der kanonische Preload-Besitzer fuer AHCI-Controller. Der
 Kernel verwendet seinen eingebauten Ein-Slot-Pollingpfad nur noch als Rettung,
 wenn der Preload-Treiber fehlt oder bereits kontrolliert fehlgeschlagen ist.
 Ein aktiver Preload-Treiber und der Rettungspfad greifen niemals gleichzeitig
@@ -17,6 +17,14 @@ IDENTIFY-Puffer. IDENTIFY DEVICE bestimmt Kapazitaet, 28-/48-Bit-LBA,
 logische Sektorgroesse von 512 bis 4096 Bytes, DMA, Schreibcache, Flush,
 NCQ und Laufwerks-Queue-Tiefe. Eine Ueberbelegung der festen acht
 Backendplaetze wird nicht still abgeschnitten, sondern verwirft das Inventar.
+
+Nach einem HBA-Reset wird jeder implementierte Port zuerst bei angehaltener
+Command Engine mit Command List und Received-FIS-Area vorbereitet. Erst dann
+aktiviert der Treiber FIS-Empfang sowie POD/SUD und wartet begrenzt auf Link,
+Signatur und einen bereiten Taskfile-Status. Die Command Engine startet erst
+danach vor IDENTIFY. Damit wird ein reales Laufwerk hinter einem Port mit
+stufenweisem Spin-up nicht mehr durch eine verfruehte PxSSTS-Pruefung als
+abwesend verworfen; leere Ports bleiben weiterhin ohne Backend.
 
 Datenpfad
 ---------

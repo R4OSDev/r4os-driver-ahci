@@ -269,6 +269,14 @@ pub fn linkReady(ssts: u32) bool {
     return det == 3 and (ipm == 1 or ipm == 2);
 }
 
+/// DET=1 already proves physical presence even though communication has not
+/// completed.  In particular, a staggered-spin-up port may remain below the
+/// linkReady boundary until software raises PxCMD.SUD after an HBA reset.
+pub fn linkDetected(ssts: u32) bool {
+    const det = ssts & 0x0F;
+    return det == 1 or det == 3;
+}
+
 pub fn needsRecovery(irq_status: u32, tfd: u32, ssts: u32) bool {
     return (irq_status & (error_irq_mask | link_irq_mask)) != 0 or
         (tfd & (tfd_err | tfd_bsy | tfd_drq)) != 0 or
@@ -408,6 +416,10 @@ test "DMA EXT and FPDMA FIS layouts keep count, tag, and LBA distinct" {
 test "range, reset trigger, identity, and wrapped deadline rules are bounded" {
     try std.testing.expectEqual(@as(u16, 4096), transferSectors(2 * 1024 * 1024, 512, true));
     try std.testing.expectEqual(@as(u16, 256), transferSectors(2 * 1024 * 1024, 512, false));
+    try std.testing.expect(!linkDetected(0));
+    try std.testing.expect(linkDetected(1));
+    try std.testing.expect(linkDetected(3));
+    try std.testing.expect(!linkReady(1));
     try std.testing.expect(linkReady(3 | (1 << 8)));
     try std.testing.expect(needsRecovery(irq_tfes, 0, 3 | (1 << 8)));
     try std.testing.expect(needsRecovery(0, tfd_bsy, 3 | (1 << 8)));
