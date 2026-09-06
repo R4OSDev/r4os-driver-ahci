@@ -17,6 +17,9 @@ IDENTIFY-Puffer. IDENTIFY DEVICE bestimmt Kapazitaet, 28-/48-Bit-LBA,
 logische Sektorgroesse von 512 bis 4096 Bytes, DMA, Schreibcache, Flush,
 NCQ und Laufwerks-Queue-Tiefe. Eine Ueberbelegung der festen acht
 Backendplaetze wird nicht still abgeschnitten, sondern verwirft das Inventar.
+Die Kapazitaetspruefung liegt derzeit vor der Anwesenheitspruefung des naechsten
+implementierten Ports. Sind alle acht Plaetze belegt, kann daher auch ein
+weiterer leerer Port das Inventar verwerfen.
 
 Nach einem HBA-Reset wird jeder implementierte Port zuerst bei angehaltener
 Command Engine mit Command List und Received-FIS-Area vorbereitet. Erst dann
@@ -47,6 +50,9 @@ HBA-Interruptquellen bleiben waehrend des synchronen Pre-LAPIC-Bootpfads aber
 maskiert und werden erst am asynchronen Runtime-Vertrag freigeschaltet. Fehlt
 eine Route, verwendet derselbe Pfad eine endliche Pollingabnahme. Der
 synchrone Bootcallback treibt dieselbe Slot-, DMA- und Completionlogik inline.
+Der aktuelle Worker plant bei weiter bestehendem Anfragebesitz auch mit
+freigeschalteten IRQs einen Nachfolger; die Folge dieser kurzen Durchlaeufe
+pollt dadurch weiterhin.
 
 Fehler und Shutdown
 -------------------
@@ -55,9 +61,12 @@ Error-FIS, Taskfile-Fehler, Linkwechsel, Timeout und aktive Cancellation
 schliessen zuerst die Aufnahme. Der Port wird gestoppt, per COMRESET
 zurueckgesetzt und erneut identifiziert. Erst bei identischer Kapazitaet und
 identischen Faehigkeiten wird er wieder geoeffnet. Scheitert die
-Portquieszenz, eskaliert der Treiber auf einen HBA-Reset; unsicheres DMA fuehrt
-zum geschlossenen beziehungsweise quarantaenisierten Backend. Jede angenommene
-Anfrage besitzt eine Generation und genau eine Abschlussmeldung.
+Portquieszenz, wird die Controller-Recovery betreten. Der eigentliche HBA-Reset
+wird dort derzeit nur bei erfolgreich gestoppten Ports versucht; ein weiter
+laufender Port verhindert diese Eskalation. Unsicheres DMA behaelt seine
+Abbildungen im geschlossenen beziehungsweise quarantaenisierten Backend.
+Anfragen sind generationengebunden. Im synchronen Bootpfad kann die
+Fehlerrueckgabe allerdings bereits vor dem Ende dieses DMA-Besitzes erfolgen.
 
 Beim Shutdown wird nach geschlossener Aufnahme der Schreibcache geleert, IRQ
 und Command Engine werden gestoppt, offene Besitzer abgeschlossen und erst
@@ -70,5 +79,7 @@ Build und Test
     Build.bat test
     ./Build.sh test
 
-Das Artefakt wird unter C:\R4OS\DRIVERS\AHCI.R4D installiert. Die Buildstarter
-leiten alle Workspacepfade aus ihrem eigenen Verzeichnis und Settings.R4S ab.
+Das Artefakt entsteht gemaess ARTIFACTS_ROOT unter
+Artifacts/Modules/AHCI/AHCI.R4D im Workspace. Das Imageziel lautet
+C:\R4OS\DRIVERS\AHCI.R4D. Die Buildstarter leiten alle Workspacepfade aus ihrem
+eigenen Verzeichnis und Settings.R4S ab.

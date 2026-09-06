@@ -21,13 +21,18 @@ depth-one path, and missing IRQ routing retains bounded polling. MSI/INTx is
 configured only during driver initialization; HBA interrupt sources remain
 masked during the synchronous pre-LAPIC boot path and are armed by the first
 asynchronous runtime request. Deferred completion work is finite per pass.
+While requests remain owned, the current worker posts a successor even when
+interrupts are armed; the complete sequence therefore also polls in IRQ mode.
 PxCI and PxSACT are authoritative; a non-zero PRDBC must match the complete
 transfer, while zero is accepted as unreported for compatible NCQ HBAs.
 
 Timeout, cancellation, Error-FIS and link failures close admission before a
 port reset. A successful reset re-identifies the same disk before reopening;
-otherwise an HBA reset is attempted and the backend remains closed on any
-identity or quiescence uncertainty.
+otherwise controller recovery is entered. The current HBA-reset attempt is
+conditional on every port stopping successfully, so a stuck command engine
+prevents that escalation. The backend remains closed on identity or quiescence
+uncertainty. Failed recovery retains unsafe DMA mappings, but synchronous boot
+callbacks currently return an error before that ownership necessarily ends.
 
 Initial discovery follows the hardware ordering required after an HBA reset:
 each implemented port is stopped and receives valid command-list/FIS bases,
