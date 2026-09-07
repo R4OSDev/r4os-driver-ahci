@@ -204,6 +204,7 @@ const ControllerState = struct {
     irq_routes: [IRQ_ROUTE_CAPACITY]u8 = .{0xFF} ** IRQ_ROUTE_CAPACITY,
     irq_route_count: usize = 0,
     work_pending: bool = false,
+    work_generation: u64 = 0,
     work_handles: [WORK_HANDLE_COUNT]u32 = .{0} ** WORK_HANDLE_COUNT,
     sync_busy: bool = false,
     sync_done: bool = false,
@@ -1158,6 +1159,9 @@ fn irqHandler(irq: u8, raw_context: usize) callconv(.c) u32 {
 
 fn scheduleControllerWork(controller: *ControllerState, from_irq: bool) bool {
     if (@atomicLoad(bool, &controller.shutting_down, .acquire)) return false;
+    // Submission, cancellation and IRQ all publish an event before testing
+    // pending. An event during a drain therefore survives its final handoff.
+    _ = @atomicRmw(u64, &controller.work_generation, .Add, 1, .acq_rel);
     if (@atomicRmw(bool, &controller.work_pending, .Xchg, true, .acq_rel)) return true;
     const ctx = controllerContext(controller);
     releaseCompletedWork(controller, &ctx);
@@ -1186,8 +1190,11 @@ fn controllerWork(raw_context: usize) callconv(.c) i32 {
     const controller: *ControllerState = @ptrFromInt(raw_context);
     const ctx = controllerContext(controller);
     releaseCompletedWork(controller, &ctx);
-    @atomicStore(bool, &controller.work_pending, false, .release);
-    if (@atomicLoad(bool, &controller.shutting_down, .acquire)) return 0;
+    const observed_generation = @atomicLoad(u64, &controller.work_generation, .acquire);
+    if (@atomicLoad(bool, &controller.shutting_down, .acquire)) {
+        @atomicStore(bool, &controller.work_pending, false, .release);
+        return 0;
+    }
 
     // A driver-work callback may have been woken from an interrupt. Keep each
     // pass finite so the interrupted frame can return and issue its APIC EOI;
@@ -1196,11 +1203,27 @@ fn controllerWork(raw_context: usize) callconv(.c) i32 {
     if (recoveryTrigger(controller)) |trigger| {
         _ = recoverPort(&ports[trigger.port_index], trigger.handle, trigger.result, trigger.reason);
     }
-    if (controllerOwnsRequests(controller) and
-        !@atomicLoad(bool, &controller.shutting_down, .acquire) and
-        !scheduleControllerWork(controller, false))
-    {
-        pollControllerInline(controller, 0);
+    @atomicStore(bool, &controller.work_pending, false, .release);
+    switch (ahci_state.runtimeWorkDecision(
+        @atomicLoad(bool, &controller.interrupts_armed, .acquire),
+        @atomicLoad(u64, &controller.work_generation, .acquire) != observed_generation,
+        controllerOwnsRequests(controller),
+        @atomicLoad(bool, &controller.shutting_down, .acquire),
+    )) {
+        .stop => {},
+        .event => {
+            // Never wait from an IRQ-originated handoff. If the bounded work
+            // queue is full, the block owner's published request timeout
+            // calls storageCancel, whose task-context inline drain recovers
+            // both a missed completion and a device that stopped responding.
+            _ = scheduleControllerWork(controller, false);
+        },
+        .poll => {
+            // No interrupt route: keep the old fallback, with a real wait
+            // between finite passes instead of immediately requeueing.
+            ctx.waitTicks(1);
+            if (!scheduleControllerWork(controller, false)) pollControllerInline(controller, 0);
+        },
     }
     return 0;
 }

@@ -1,7 +1,7 @@
 ﻿AHCI.R4D
 ========
 
-Version 0.2.1 ist der kanonische Preload-Besitzer fuer AHCI-Controller. Der
+Version 0.2.2 ist der kanonische Preload-Besitzer fuer AHCI-Controller. Der
 Kernel verwendet seinen eingebauten Ein-Slot-Pollingpfad nur noch als Rettung,
 wenn der Preload-Treiber fehlt oder bereits kontrolliert fehlgeschlagen ist.
 Ein aktiver Preload-Treiber und der Rettungspfad greifen niemals gleichzeitig
@@ -50,9 +50,12 @@ HBA-Interruptquellen bleiben waehrend des synchronen Pre-LAPIC-Bootpfads aber
 maskiert und werden erst am asynchronen Runtime-Vertrag freigeschaltet. Fehlt
 eine Route, verwendet derselbe Pfad eine endliche Pollingabnahme. Der
 synchrone Bootcallback treibt dieselbe Slot-, DMA- und Completionlogik inline.
-Der aktuelle Worker plant bei weiter bestehendem Anfragebesitz auch mit
-freigeschalteten IRQs einen Nachfolger; die Folge dieser kurzen Durchlaeufe
-pollt dadurch weiterhin.
+Bei freigeschalteten IRQs erzeugt unveraenderter Anfragebesitz keinen
+Nachfolger. Eine Ereignisgeneration sichert IRQ-, Submit- und Cancel-Signale
+waehrend der Abnahme. Ohne IRQ-Route wartet der Pollingpfad zwischen
+endlichen Durchlaeufen einen Tick. Fehlende IRQs oder volle Workkapazitaet
+werden spaetestens durch das registrierte endliche Block-Timeout und den
+Cancel-/Recovery-Pfad im Taskkontext aufgefangen.
 
 Fehler und Shutdown
 -------------------

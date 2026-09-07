@@ -1,5 +1,22 @@
 const std = @import("std");
 
+pub const RuntimeWork = enum { stop, event, poll };
+
+pub fn runtimeWorkDecision(interrupts_armed: bool, event_changed: bool, owns_requests: bool, shutting_down: bool) RuntimeWork {
+    if (shutting_down) return .stop;
+    if (event_changed) return .event;
+    return if (owns_requests and !interrupts_armed) .poll else .stop;
+}
+
+test "runtime work sleeps without a new IRQ and retains handoff and polling events" {
+    for (0..128) |_| try std.testing.expectEqual(RuntimeWork.stop, runtimeWorkDecision(true, false, true, false));
+    try std.testing.expectEqual(RuntimeWork.event, runtimeWorkDecision(true, true, true, false));
+    // A late event can also finish an already drained request or cancel.
+    try std.testing.expectEqual(RuntimeWork.event, runtimeWorkDecision(true, true, false, false));
+    try std.testing.expectEqual(RuntimeWork.poll, runtimeWorkDecision(false, false, true, false));
+    try std.testing.expectEqual(RuntimeWork.stop, runtimeWorkDecision(false, true, true, true));
+}
+
 pub const max_command_slots: usize = 16;
 pub const max_prdt_entries: usize = 64;
 pub const prdt_entry_max_bytes: u32 = 4 * 1024 * 1024;
