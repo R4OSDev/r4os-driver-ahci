@@ -200,6 +200,7 @@ const ControllerState = struct {
     port_indices: [MAX_BACKENDS]u8 = .{0} ** MAX_BACKENDS,
     port_count: usize = 0,
     irq_registered: bool = false,
+    interrupts_attempted: bool = false,
     interrupts_armed: bool = false,
     irq_mode: u8 = 0,
     irq_routes: [IRQ_ROUTE_CAPACITY]u8 = .{0xFF} ** IRQ_ROUTE_CAPACITY,
@@ -372,9 +373,9 @@ fn initializeController(controller: *ControllerState, ctx: *const r4os.r4dev.Dri
     }
 
     if (controller.port_count != 0) {
-        if (!setupInterrupts(controller, ctx)) {
-            ctx.logWarn("AHCI.R4D IRQ route unavailable; bounded polling fallback active");
-        }
+        // Preload runs before local/controller identity and IRQ routing are
+        // confirmed. Keep sources masked and bind IRQs at the v2 boundary.
+        disableControllerInterrupts(controller);
         if (!registerControllerBackends(controller, ctx)) return failController(controller, 6);
     }
     controller.phase = .ready;
@@ -753,13 +754,20 @@ fn enableControllerInterrupts(controller: *ControllerState) void {
 }
 
 fn armRuntimeInterrupts(controller: *ControllerState) bool {
-    if (!controller.irq_registered or @atomicLoad(bool, &controller.interrupts_armed, .acquire)) return true;
+    if (@atomicLoad(bool, &controller.interrupts_armed, .acquire)) return true;
     if (!acquireController(controller)) return false;
     defer releaseController(controller);
-    if (!controller.interrupts_armed) {
-        // The preload path runs before LAPIC initialization. MSI is configured
-        // during driver init, but HBA sources remain masked until the v2 async
-        // boundary proves that the scheduler and deferred worker are live.
+    if (controller.shutting_down) return false;
+    if (!controller.interrupts_attempted) {
+        const ctx = controllerContext(controller);
+        controller.interrupts_attempted = true;
+        if (!setupInterrupts(controller, &ctx)) {
+            ctx.logWarn("AHCI.R4D IRQ route unavailable; bounded polling fallback active");
+        }
+    }
+    if (controller.irq_registered and !controller.interrupts_armed) {
+        // Scheduler/deferred workers and the interrupt controller now have
+        // their real runtime identity. Polling remains active on refusal.
         enableControllerInterrupts(controller);
         @atomicStore(bool, &controller.interrupts_armed, true, .release);
     }
