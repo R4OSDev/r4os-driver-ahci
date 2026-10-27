@@ -1,6 +1,16 @@
 ﻿AHCI.R4D
 ========
 
+0.87.56: IRQ-Abmeldung muss echte Freigabe quittieren. Nicht quittierte
+Routen bleiben registriert/retiring und behalten Kontext, MSI-Identitaet und
+benoetigte DMA-Ressourcen. Shutdown/Backend geben fehlende Quittungen weiter;
+kein Freigabeerfolg aus dem blossen Abmeldeversuch. Hostqualifikation und
+finale KVM4-/native16-IRQowner-/FPU-/Audio-/Rebootfaelle abgeschlossen.
+AC97/RTL8139 sind zusaetzlich echte KVM-Geraetefaelle; RTL8168/HDA nativ.
+Keine separate native Modulunload-/physische Sicht-/Hoer-/Latenzquittung.
+Genau1finalSTANDARD56 lokal+R4OSServer vollstaendig validiert.
+Zentraler Beleg: Core/Parallelitaet.txt.56.
+
 Version 0.2.2 ist der kanonische Preload-Besitzer fuer AHCI-Controller. Der
 Kernel verwendet seinen eingebauten Ein-Slot-Pollingpfad nur noch als Rettung,
 wenn der Preload-Treiber fehlt oder bereits kontrolliert fehlgeschlagen ist.

@@ -1850,14 +1850,20 @@ fn releaseDriverWork(controller: *ControllerState, ctx: *const r4os.r4dev.Driver
 
 fn unregisterInterrupts(controller: *ControllerState, ctx: *const r4os.r4dev.DriverContext) bool {
     const used_msi = controller.irq_mode == 2;
+    var remaining: usize = 0;
     for (controller.irq_routes[0..controller.irq_route_count]) |route| {
-        if (route < 32) _ = ctx.irqUnregister(route, irqHandler, @intFromPtr(controller));
+        if (route >= 32 or ctx.irqUnregister(route, irqHandler, @intFromPtr(controller)) != 0) {
+            controller.irq_routes[remaining] = route;
+            remaining += 1;
+        }
     }
-    controller.irq_registered = false;
+    @memset(controller.irq_routes[remaining..], 0xFF);
+    controller.irq_route_count = remaining;
+    controller.irq_registered = remaining != 0;
+    if (remaining != 0) return false;
     controller.interrupts_armed = false;
-    controller.irq_route_count = 0;
-    controller.irq_mode = 0;
     if (used_msi and ctx.pciDisableMsi(controller.info) != 0) return false;
+    controller.irq_mode = 0;
     return true;
 }
 
