@@ -22,4 +22,12 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run deterministic AHCI identify, queue, PRDT, and recovery-state tests");
     test_step.dependOn(b.getInstallStep());
     test_step.dependOn(&run_state_tests.step);
+    const cleanup_cases = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    });
+    cleanup_cases.addImport("r4os", sdk.createR4osModule(b.graph.host, .Debug));
+    const cleanup_tests = b.addTest(.{ .root_module = cleanup_cases, .filters = &.{"AHCI cleanup "} });
+    test_step.dependOn(&b.addRunArtifact(cleanup_tests).step);
 }

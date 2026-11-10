@@ -139,6 +139,8 @@ const IoSlot = struct {
     pin: r4os.abi.DmaPinnedBuffer = .{},
     mapping: r4os.abi.DmaMapping = .{},
     shared_buffer: ?*r4os.r4dev.SharedDmaBuffer = null,
+    finishing: bool = false,
+    cleanup_retained: bool = false,
 };
 
 const PortState = struct {
@@ -178,9 +180,10 @@ const PortState = struct {
 };
 
 const ControllerState = struct {
+    cleanup_retained: bool = false,
     used: bool = false,
     index: u8 = 0,
-    api: ?*const r4os.r4dev.DriverApi = null,
+    api: ?*const r4os.r4dev.DriverApi2 = null,
     info: r4os.abi.PciDeviceInfo = .{},
     phase: ControllerPhase = .cold,
     present: bool = false,
@@ -218,7 +221,7 @@ const ControllerState = struct {
     last_error: u32 = 0,
 };
 
-var driver_api: ?*const r4os.r4dev.DriverApi = null;
+var driver_api: ?*const r4os.r4dev.DriverApi2 = null;
 var controllers: [MAX_CONTROLLERS]ControllerState = .{ControllerState{}} ** MAX_CONTROLLERS;
 var ports: [MAX_BACKENDS]PortState = .{PortState{}} ** MAX_BACKENDS;
 var controller_count: usize = 0;
@@ -229,12 +232,128 @@ var inventory_complete: bool = true;
 var next_sync_sequence: u64 = 1;
 
 comptime {
-    asm (r4os.r4dev.driverEntriesAsm("ahci_init", "ahci_shutdown"));
+    asm (r4os.technical2.driverEntriesAsm("ahci_init", "ahci_shutdown"));
 }
 
-export fn ahci_init(api: *const r4os.r4dev.DriverApi) callconv(.c) i32 {
-    var ctx = r4os.r4dev.DriverContext.init(api);
-    if (!ctx.apiCompatible()) {
+// These cases invoke the real finish path with only its actual DriverApi2
+// DMA callbacks replaced. No port/MMIO access or hardware completion is modeled.
+const CleanupProbe = struct {
+    const Mode = enum { unmap_fail, unpin_fail, success };
+    var mode: Mode = .success;
+    var unmaps: usize = 0;
+    var unpins: usize = 0;
+    var frees: usize = 0;
+    var completions: usize = 0;
+    fn unmap(mapping: *r4os.abi.DmaMapping) callconv(.c) i32 {
+        unmaps += 1;
+        if (mode == .unmap_fail) return -2;
+        mapping.handle = 0;
+        return 0;
+    }
+    fn unpin(pin: *r4os.abi.DmaPinnedBuffer) callconv(.c) i32 {
+        unpins += 1;
+        if (mode == .unpin_fail) return -3;
+        pin.handle = 0;
+        return 0;
+    }
+    fn free(_: *r4os.abi.DmaBuffer) callconv(.c) void { frees += 1; }
+    fn complete(handle: u64, result: i32, bytes: u32) callconv(.c) void {
+        std.debug.assert(handle == 1234 and result == 0 and bytes == 512);
+        completions += 1;
+    }
+    fn api(output: *r4os.r4dev.DriverApi2, selected: Mode) void {
+        mode = selected; unmaps = 0; unpins = 0; frees = 0; completions = 0;
+        @memset(std.mem.asBytes(output), 0);
+        output.magic = r4os.technical2.abi.driver_magic;
+        output.version = r4os.technical2.abi.driver_version;
+        output.size = @sizeOf(r4os.r4dev.DriverApi2);
+        output.dma_unmap = unmap;
+        output.dma_unpin_buffer = unpin;
+        output.free_dma_region = free;
+    }
+};
+test "AHCI cleanup retains real slot callback and buffer on failed DMA acknowledgements" {
+    for ([_]CleanupProbe.Mode{ .unmap_fail, .unpin_fail }) |mode| {
+        var api: r4os.r4dev.DriverApi2 = undefined;
+        CleanupProbe.api(&api, mode);
+        var controller: ControllerState = .{ .used = true, .api = &api, .port_count = 1 };
+        const port = &ports[0];
+        port.* = .{ .used = true, .configured = true, .accepting = true };
+        defer port.* = .{};
+        var buffer: r4os.r4dev.SharedDmaBuffer = .{ .region = .{}, .payload_bytes = 4096 };
+        const slot = &port.slots[0];
+        slot.* = .{ .phase = .completing, .generation = 7, .handle = 1234,
+            .mapping = .{ .handle = 11 }, .pin = .{ .handle = 22 },
+            .shared_buffer = &buffer, .complete = CleanupProbe.complete };
+        finishSlot(&controller, port, 0, 0, 512);
+        try std.testing.expectEqual(@as(usize, 1), CleanupProbe.unmaps);
+        try std.testing.expectEqual(@as(usize, if (mode == .unmap_fail) 0 else 1), CleanupProbe.unpins);
+        try std.testing.expectEqual(@as(usize, 0), CleanupProbe.frees);
+        try std.testing.expectEqual(@as(usize, 0), CleanupProbe.completions);
+        try std.testing.expectEqual(@as(u32, if (mode == .unmap_fail) 11 else 0), slot.mapping.handle);
+        try std.testing.expectEqual(@as(u32, 22), slot.pin.handle);
+        try std.testing.expect(slot.shared_buffer == &buffer and buffer.references == 1);
+        try std.testing.expect(slot.phase == .completing and slot.handle == 1234 and slot.generation == 7);
+        try std.testing.expect(slot.cleanup_retained and controller.cleanup_retained and !port.accepting);
+        // A repeated finish cannot replay any release or callback.
+        finishSlot(&controller, port, 0, 0, 512);
+        try std.testing.expectEqual(@as(usize, 1), CleanupProbe.unmaps);
+        try std.testing.expectEqual(@as(usize, 0), CleanupProbe.completions);
+    }
+}
+test "AHCI cleanup publishes exact completion only after mapping pin and buffer retirement" {
+    var api: r4os.r4dev.DriverApi2 = undefined;
+    CleanupProbe.api(&api, .success);
+    var controller: ControllerState = .{ .used = true, .api = &api, .port_count = 1 };
+    const port = &ports[0];
+    port.* = .{ .used = true, .configured = true, .accepting = true };
+    defer port.* = .{};
+    var buffer: r4os.r4dev.SharedDmaBuffer = .{ .region = .{}, .payload_bytes = 4096 };
+    port.slots[0] = .{ .phase = .completing, .generation = 7, .handle = 1234,
+        .mapping = .{ .handle = 11 }, .pin = .{ .handle = 22 },
+        .shared_buffer = &buffer, .complete = CleanupProbe.complete };
+    finishSlot(&controller, port, 0, 0, 512);
+    try std.testing.expectEqual(@as(usize, 1), CleanupProbe.unmaps);
+    try std.testing.expectEqual(@as(usize, 1), CleanupProbe.unpins);
+    try std.testing.expectEqual(@as(usize, 1), CleanupProbe.frees);
+    try std.testing.expectEqual(@as(usize, 1), CleanupProbe.completions);
+    try std.testing.expect(port.slots[0].phase == .free and port.slots[0].generation == 7);
+    try std.testing.expect(!controller.cleanup_retained and port.accepting);
+}
+
+test "AHCI cleanup rejection retains admission until actual DMA release acknowledges" {
+    for ([_]CleanupProbe.Mode{ .unmap_fail, .unpin_fail, .success }) |mode| {
+        var api: r4os.r4dev.DriverApi2 = undefined;
+        CleanupProbe.api(&api, mode);
+        var controller: ControllerState = .{ .used = true, .api = &api, .port_count = 1 };
+        const port = &ports[0];
+        port.* = .{ .used = true, .configured = true, .accepting = true, .owned_count = 1 };
+        defer port.* = .{};
+        var buffer: r4os.r4dev.SharedDmaBuffer = .{ .region = .{}, .payload_bytes = 4096 };
+        const slot = &port.slots[0];
+        slot.* = .{ .phase = .preparing, .generation = 7, .handle = 1234,
+            .mapping = .{ .handle = 11 }, .pin = .{ .handle = 22 },
+            .shared_buffer = &buffer, .complete = CleanupProbe.complete };
+        const rejected = rejectPreparedSlot(&controller, port, 0);
+        try std.testing.expectEqual(mode == .success, rejected);
+        try std.testing.expectEqual(@as(usize, 0), CleanupProbe.completions);
+        if (mode == .success) {
+            try std.testing.expectEqual(@as(usize, 1), CleanupProbe.frees);
+            try std.testing.expect(slot.phase == .free and slot.generation == 7 and port.owned_count == 0);
+        } else {
+            try std.testing.expectEqual(@as(usize, 0), CleanupProbe.frees);
+            try std.testing.expect(slot.phase == .preparing and slot.generation == 7 and slot.handle == 1234);
+            try std.testing.expect(slot.shared_buffer == &buffer and buffer.references == 1 and port.owned_count == 1);
+            try std.testing.expect(controller.cleanup_retained and !port.accepting);
+            try std.testing.expect(!rejectPreparedSlot(&controller, port, 0));
+            try std.testing.expectEqual(@as(usize, 1), CleanupProbe.unmaps);
+        }
+    }
+}
+
+export fn ahci_init(api: *const r4os.r4dev.DriverApi2) callconv(.c) i32 {
+    var ctx = r4os.r4dev.DriverContext2.init(api);
+    if (!ctx.apiCompatible() or !ctx.requires(.{ "alloc_dma_region_constrained", "dma_map_pinned", "dma_pin_buffer", "dma_unmap", "dma_unpin_buffer", "driver_completion_release", "driver_completion_status", "driver_completion_wait", "driver_work_cancel", "driver_work_submit", "free_dma_region", "irq_register", "irq_unregister", "log_error", "log_info", "log_warn", "pci_disable_msi", "pci_enable_bus_master", "pci_enable_msi", "pci_find_by_class", "pci_map_bar", "pci_read_config32", "pci_write_config32", "register_storage_backend", "storage_backend_recovery_begin", "storage_backend_recovery_finish", "tick_count", "timer_frequency", "wait_ticks" })) {
         ctx.logError("AHCI.R4D driver api mismatch");
         return -3;
     }
@@ -291,7 +410,7 @@ export fn ahci_init(api: *const r4os.r4dev.DriverApi) callconv(.c) i32 {
 
 export fn ahci_shutdown() callconv(.c) i32 {
     const api = driver_api orelse return 0;
-    var ctx = r4os.r4dev.DriverContext.init(api);
+    var ctx = r4os.r4dev.DriverContext2.init(api);
     return if (shutdownAllControllers(&ctx)) 0 else -1;
 }
 
@@ -308,7 +427,7 @@ fn resetDriverState() void {
 }
 
 fn discoverControllers(
-    ctx: *const r4os.r4dev.DriverContext,
+    ctx: *const r4os.r4dev.DriverContext2,
     out: *[MAX_CONTROLLERS]r4os.abi.PciDeviceInfo,
     out_count: *usize,
 ) bool {
@@ -328,7 +447,7 @@ fn discoverControllers(
     }
 }
 
-fn initializeController(controller: *ControllerState, ctx: *const r4os.r4dev.DriverContext) bool {
+fn initializeController(controller: *ControllerState, ctx: *const r4os.r4dev.DriverContext2) bool {
     if (ctx.pciEnableBusMaster(controller.info, r4os.abi.pci_enable_memory_space) != 0) {
         return failController(controller, 1);
     }
@@ -385,7 +504,7 @@ fn initializeController(controller: *ControllerState, ctx: *const r4os.r4dev.Dri
 fn initializePort(
     controller: *ControllerState,
     port: *PortState,
-    ctx: *const r4os.r4dev.DriverContext,
+    ctx: *const r4os.r4dev.DriverContext2,
 ) PortInitOutcome {
     const max_phys: u64 = if (controller.supports_64bit) std.math.maxInt(u64) else std.math.maxInt(u32);
     if (ctx.allocDmaRegionConstrained(PORT_REGION_BYTES, PAGE_SIZE, max_phys, &port.region) != 0 or
@@ -453,6 +572,7 @@ fn waitPortSignature(controller: *ControllerState, port: *PortState) SignatureOu
     const base = portBase(port.hardware_port);
     const start = ctx.tickCount();
     const timeout = ahci_state.ticksFromMilliseconds(controller.timer_hz, INIT_TIMEOUT_MS);
+    var poll = r4os.driver_poll_budget.DriverPollBudget.initIterations(1_000_000, .task);
     var presence_seen = false;
     while (true) {
         const ssts = readPort32(controller, base, PORT_SSTS);
@@ -462,7 +582,7 @@ fn waitPortSignature(controller: *ControllerState, port: *PortState) SignatureOu
             if (signature == SIG_SATA) return .sata;
             if (signature != 0 and signature != 0xFFFF_FFFF) return .unsupported;
         }
-        if (ahci_state.deadlineExpired(start, timeout, ctx.tickCount()))
+        if ((poll.step(null, false) != .proceed or ahci_state.deadlineExpired(start, timeout, ctx.tickCount())))
             return if (presence_seen) .timeout else .absent;
         ctx.waitTicks(1);
     }
@@ -471,7 +591,7 @@ fn waitPortSignature(controller: *ControllerState, port: *PortState) SignatureOu
 fn releaseUnsupportedPort(
     controller: *ControllerState,
     port: *PortState,
-    ctx: *const r4os.r4dev.DriverContext,
+    ctx: *const r4os.r4dev.DriverContext2,
 ) bool {
     const base = portBase(port.hardware_port);
     if (!stopPort(controller, base)) return false;
@@ -483,7 +603,7 @@ fn releaseUnsupportedPort(
     return true;
 }
 
-fn registerControllerBackends(controller: *ControllerState, ctx: *const r4os.r4dev.DriverContext) bool {
+fn registerControllerBackends(controller: *ControllerState, ctx: *const r4os.r4dev.DriverContext2) bool {
     for (controller.port_indices[0..controller.port_count]) |port_index| {
         const port = &ports[port_index];
         setPortName(port, registered_backends);
@@ -543,8 +663,9 @@ fn biosHandoff(controller: *ControllerState) bool {
     const ctx = controllerContext(controller);
     const start = ctx.tickCount();
     const timeout = ahci_state.ticksFromMilliseconds(controller.timer_hz, 2000);
+    var poll = r4os.driver_poll_budget.DriverPollBudget.initIterations(1_000_000, .task);
     while ((read32(controller, REG_BOHC) & (BOHC_BOS | BOHC_BB)) != 0) {
-        if (ahci_state.deadlineExpired(start, timeout, ctx.tickCount())) return false;
+        if ((poll.step(null, false) != .proceed or ahci_state.deadlineExpired(start, timeout, ctx.tickCount()))) return false;
         ctx.waitTicks(1);
     }
     return true;
@@ -619,6 +740,7 @@ fn identifyDrive(controller: *ControllerState, port: *PortState) ?ahci_state.Dri
     const ctx = controllerContext(controller);
     const start = ctx.tickCount();
     const timeout = ahci_state.ticksFromMilliseconds(controller.timer_hz, IDENTIFY_TIMEOUT_MS);
+    var poll = r4os.driver_poll_budget.DriverPollBudget.initIterations(1_000_000, .task);
     while (true) {
         dmaFence();
         const ci = readPort32(controller, base, PORT_CI);
@@ -634,7 +756,7 @@ fn identifyDrive(controller: *ControllerState, port: *PortState) ?ahci_state.Dri
             return null;
         }
         if (ahci_state.slotCompleted(ci, sact, 0)) break;
-        if (ahci_state.deadlineExpired(start, timeout, ctx.tickCount())) {
+        if ((poll.step(null, false) != .proceed or ahci_state.deadlineExpired(start, timeout, ctx.tickCount()))) {
             port.timeouts +%= 1;
             port.last_error = 20;
             return null;
@@ -684,7 +806,7 @@ fn prepareHardwareCommand(
     };
 }
 
-fn setupInterrupts(controller: *ControllerState, ctx: *const r4os.r4dev.DriverContext) bool {
+fn setupInterrupts(controller: *ControllerState, ctx: *const r4os.r4dev.DriverContext2) bool {
     disableControllerInterrupts(controller);
     controller.irq_registered = false;
     controller.interrupts_armed = false;
@@ -721,7 +843,7 @@ fn setupInterrupts(controller: *ControllerState, ctx: *const r4os.r4dev.DriverCo
     return controller.irq_registered;
 }
 
-fn registerIrqRoute(controller: *ControllerState, ctx: *const r4os.r4dev.DriverContext, route: u8) bool {
+fn registerIrqRoute(controller: *ControllerState, ctx: *const r4os.r4dev.DriverContext2, route: u8) bool {
     if (route >= 32 or controller.irq_route_count >= controller.irq_routes.len) return false;
     for (controller.irq_routes[0..controller.irq_route_count]) |existing| {
         if (existing == route) return true;
@@ -819,7 +941,7 @@ fn storageFlush(raw: ?*anyopaque) callconv(.c) i32 {
 fn storageShutdown(raw: ?*anyopaque) callconv(.c) i32 {
     _ = raw;
     const api = driver_api orelse return 0;
-    var ctx = r4os.r4dev.DriverContext.init(api);
+    var ctx = r4os.r4dev.DriverContext2.init(api);
     return if (shutdownAllControllers(&ctx)) 0 else -1;
 }
 
@@ -891,6 +1013,7 @@ fn submitRequest(port: *PortState, request: *const r4os.abi.StorageRequest, bypa
 fn submitRequestWithBuffer(port: *PortState, request: *const r4os.abi.StorageRequest, bypass_admission: bool, shared_buffer: ?*r4os.r4dev.SharedDmaBuffer) i32 {
     const controller = controllerForPort(port) orelse return -1;
     if (!validRequestHeader(request)) return -1;
+    if (@atomicLoad(bool, &controller.cleanup_retained, .acquire)) return -2;
     if (!bypass_admission and (!@atomicLoad(bool, &port.accepting, .acquire) or
         @atomicLoad(bool, &port.shutting_down, .acquire)))
     {
@@ -911,27 +1034,28 @@ fn submitRequestWithBuffer(port: *PortState, request: *const r4os.abi.StorageReq
     releaseController(controller);
 
     if (!prepareRequest(controller, port, slot_index, request)) {
-        rejectPreparedSlot(controller, port, slot_index);
+        if (!rejectPreparedSlot(controller, port, slot_index)) return 0;
         return -5;
     }
     if (port.slots[slot_index].requires_ready_wait and
         !waitPortReady(controller, portBase(port.hardware_port), INIT_TIMEOUT_MS))
     {
-        rejectPreparedSlot(controller, port, slot_index);
+        if (!rejectPreparedSlot(controller, port, slot_index)) return 0;
         return -6;
     }
 
     if (!acquireController(controller)) {
-        rejectPreparedSlot(controller, port, slot_index);
+        if (!rejectPreparedSlot(controller, port, slot_index)) return 0;
         return -7;
     }
     const slot = &port.slots[slot_index];
     if (slot.phase != .preparing or slot.handle != request.handle or
         slot.port_generation != port.generation or controller.phase != .ready or controller.recovering or
+        @atomicLoad(bool, &controller.cleanup_retained, .acquire) or
         port.recovering or (!bypass_admission and (!port.accepting or port.shutting_down)))
     {
         releaseController(controller);
-        rejectPreparedSlot(controller, port, slot_index);
+        if (!rejectPreparedSlot(controller, port, slot_index)) return 0;
         return -8;
     }
     if (slot.cancel_reason != 0) {
@@ -948,7 +1072,7 @@ fn submitRequestWithBuffer(port: *PortState, request: *const r4os.abi.StorageReq
     const ssts = readPort32(controller, base, PORT_SSTS);
     if ((tfd & ahci_state.tfd_err) != 0 or !ahci_state.linkReady(ssts)) {
         releaseController(controller);
-        rejectPreparedSlot(controller, port, slot_index);
+        if (!rejectPreparedSlot(controller, port, slot_index)) return 0;
         return -9;
     }
     slot.phase = .active;
@@ -1043,14 +1167,12 @@ fn prepareRequest(
     else
         r4os.abi.dma_direction_to_device;
     if (ctx.mapDmaPinned(&slot.pin, &constraints, direction, &slot.mapping) != 0) {
-        _ = ctx.unpinDmaBuffer(&slot.pin);
-        slot.pin = .{};
+        // The rejection path retains this exact pin if its release fails.
         return false;
     }
 
     var segments: [ahci_state.max_prdt_entries]ahci_state.PhysicalSegment = undefined;
     if (slot.mapping.segment_count == 0 or slot.mapping.segment_count > segments.len) {
-        releaseSlotMapping(controller, slot);
         return false;
     }
     var index: usize = 0;
@@ -1061,7 +1183,6 @@ fn prepareRequest(
         };
     }
     const plan = ahci_state.buildPrdtPlan(segments[0..index], request.buffer_bytes) catch {
-        releaseSlotMapping(controller, slot);
         return false;
     };
     const command = dataCommand(port, request.operation);
@@ -1073,7 +1194,6 @@ fn prepareRequest(
         port.ncq,
         port.identity.lba48,
     ) catch {
-        releaseSlotMapping(controller, slot);
         return false;
     };
     prepareHardwareCommand(port, slot_index, &fis, &plan, request.operation == r4os.abi.storage_request_op_write);
@@ -1090,51 +1210,77 @@ fn dataCommand(port: *const PortState, operation: u32) u8 {
     return if (operation == r4os.abi.storage_request_op_read) ATA_READ_DMA else ATA_WRITE_DMA;
 }
 
-fn rejectPreparedSlot(controller: *ControllerState, port: *PortState, slot_index: usize) void {
-    if (slot_index >= port.slots.len) return;
-    const slot = &port.slots[slot_index];
-    releaseSlotMapping(controller, slot);
-    if (!acquireController(controller)) return;
-    if (slot.phase == .preparing) {
-        const generation = slot.generation;
-        slot.* = .{ .generation = generation };
-        if (port.owned_count != 0) port.owned_count -= 1;
-    }
-    releaseController(controller);
+fn retainSlotCleanup(controller: *ControllerState, slot: *IoSlot) void {
+    @atomicStore(bool, &slot.cleanup_retained, true, .release);
+    for (controller.port_indices[0..controller.port_count]) |index|
+        @atomicStore(bool, &ports[index].accepting, false, .release);
+    if (!@atomicRmw(bool, &controller.cleanup_retained, .Xchg, true, .acq_rel))
+        controllerContext(controller).logError("AHCI.R4D DMA release not acknowledged; slot, callback and resources retained");
 }
 
-fn releaseSlotMapping(controller: *ControllerState, slot: *IoSlot) void {
+fn releaseSlotMapping(controller: *ControllerState, slot: *IoSlot) bool {
     const ctx = controllerContext(controller);
-    if (slot.mapping.handle != 0) _ = ctx.unmapDma(&slot.mapping);
-    if (slot.pin.handle != 0) _ = ctx.unpinDmaBuffer(&slot.pin);
-    slot.mapping = .{};
-    slot.pin = .{};
+    if (r4os.driver_dma_cleanup.release(&ctx, &slot.mapping, &slot.pin) != .released) {
+        retainSlotCleanup(controller, slot);
+        return false;
+    }
     if (slot.shared_buffer) |buffer| {
         slot.shared_buffer = null;
-        buffer.release(&ctx);
+        ctx.releaseSharedDmaBuffer(buffer);
     }
+    return true;
 }
 
-fn finishSlot(
-    controller: *ControllerState,
-    port: *PortState,
-    slot_index: usize,
-    result: i32,
-    bytes: u32,
-) void {
-    if (slot_index >= port.slots.len) return;
+fn rejectPreparedSlot(controller: *ControllerState, port: *PortState, slot_index: usize) bool {
+    if (slot_index >= port.slots.len or !acquireController(controller)) return false;
     const slot = &port.slots[slot_index];
-    if (slot.phase != .completing) return;
-    releaseSlotMapping(controller, slot);
-    const complete = slot.complete;
-    const handle = slot.handle;
-    if (complete) |callback| callback(handle, result, bytes);
-    if (!acquireController(controller)) return;
-    if (slot.phase == .completing and slot.handle == handle) {
-        const generation = slot.generation;
-        slot.* = .{ .generation = generation };
+    if (slot.phase != .preparing or slot.finishing or @atomicLoad(bool, &slot.cleanup_retained, .acquire)) {
+        releaseController(controller);
+        return false;
     }
+    slot.finishing = true;
+    const generation = slot.generation;
+    const handle = slot.handle;
     releaseController(controller);
+    if (!releaseSlotMapping(controller, slot)) return false;
+    if (!acquireController(controller)) {
+        retainSlotCleanup(controller, slot);
+        return false;
+    }
+    defer releaseController(controller);
+    if (slot.phase != .preparing or slot.generation != generation or slot.handle != handle) {
+        retainSlotCleanup(controller, slot);
+        return false;
+    }
+    slot.* = .{ .generation = generation };
+    if (port.owned_count != 0) port.owned_count -= 1;
+    return true;
+}
+
+fn finishSlot(controller: *ControllerState, port: *PortState, slot_index: usize, result: i32, bytes: u32) void {
+    if (slot_index >= port.slots.len or !acquireController(controller)) return;
+    const slot = &port.slots[slot_index];
+    if (slot.phase != .completing or slot.finishing or @atomicLoad(bool, &slot.cleanup_retained, .acquire)) {
+        releaseController(controller);
+        return;
+    }
+    slot.finishing = true;
+    const complete = slot.complete;
+    const generation = slot.generation;
+    const handle = slot.handle;
+    releaseController(controller);
+    if (!releaseSlotMapping(controller, slot)) return;
+    if (complete) |callback| callback(handle, result, bytes);
+    if (!acquireController(controller)) {
+        retainSlotCleanup(controller, slot);
+        return;
+    }
+    defer releaseController(controller);
+    if (slot.phase != .completing or slot.handle != handle or slot.generation != generation) {
+        retainSlotCleanup(controller, slot);
+        return;
+    }
+    slot.* = .{ .generation = generation };
 }
 
 fn validateTransfer(port: *const PortState, operation: u32, lba: u64, sectors: u32, bytes: u32, buffer_addr: u64) bool {
@@ -1146,10 +1292,13 @@ fn validateTransfer(port: *const PortState, operation: u32, lba: u64, sectors: u
         r4os.abi.storage_request_op_read, r4os.abi.storage_request_op_write => {},
         else => return false,
     }
-    if (sectors == 0 or sectors > port.max_sectors or sectors > std.math.maxInt(u16) or buffer_addr == 0) return false;
-    const expected = std.math.mul(u64, sectors, port.identity.sector_size) catch return false;
-    if (expected != bytes or expected > MAX_TRANSFER_BYTES) return false;
-    if (lba >= port.identity.sector_count or sectors > port.identity.sector_count - lba) return false;
+    if (buffer_addr == 0) return false;
+    _ = r4os.block_transfer.validate(lba, sectors, port.identity.sector_size, bytes, .{
+        .capacity_blocks = port.identity.sector_count,
+        .max_blocks = @min(port.max_sectors, std.math.maxInt(u16)),
+        .max_bytes = MAX_TRANSFER_BYTES,
+        .lba_bits = if (port.identity.lba48) 48 else 28,
+    }) catch return false;
     return true;
 }
 
@@ -1249,7 +1398,7 @@ fn controllerWork(raw_context: usize) callconv(.c) i32 {
     return 0;
 }
 
-fn releaseCompletedWork(controller: *ControllerState, ctx: *const r4os.r4dev.DriverContext) void {
+fn releaseCompletedWork(controller: *ControllerState, ctx: *const r4os.r4dev.DriverContext2) void {
     for (&controller.work_handles) |*stored| {
         const handle = @atomicLoad(u32, stored, .acquire);
         if (handle == 0) continue;
@@ -1423,6 +1572,7 @@ fn controllerOwnsHandle(controller: *ControllerState, handle: u64) bool {
 
 fn recoverPort(port: *PortState, trigger_handle: u64, trigger_result: i32, reason: u32) bool {
     const controller = controllerForPort(port) orelse return false;
+    if (@atomicLoad(bool, &controller.cleanup_retained, .acquire)) return false;
     if (@atomicLoad(bool, &controller.recovering, .acquire) or
         @atomicRmw(bool, &port.recovering, .Xchg, true, .acq_rel))
     {
@@ -1456,6 +1606,7 @@ fn recoverPort(port: *PortState, trigger_handle: u64, trigger_result: i32, reaso
 
     port.generation = nextGeneration(port.generation);
     finishAllOwnedPort(controller, port, trigger_handle, trigger_result, r4os.abi.storage_request_result_reset);
+    if (@atomicLoad(bool, &controller.cleanup_retained, .acquire)) return false;
     if (!rebasePort(controller, port)) {
         port.recovery_failures +%= 1;
         announcePortRecovery(port, true, false);
@@ -1482,6 +1633,7 @@ fn recoverPort(port: *PortState, trigger_handle: u64, trigger_result: i32, reaso
         if (controller.irq_registered and controller.interrupts_armed) ahci_state.enabled_irq_mask else 0,
     );
     port.last_error = 0;
+    if (@atomicLoad(bool, &controller.cleanup_retained, .acquire)) return false;
     @atomicStore(bool, &port.accepting, true, .release);
     announcePortRecovery(port, true, true);
     return true;
@@ -1494,6 +1646,7 @@ fn recoverController(
     trigger_result: i32,
     reason: u32,
 ) bool {
+    if (@atomicLoad(bool, &controller.cleanup_retained, .acquire)) return false;
     if (@atomicRmw(bool, &controller.recovering, .Xchg, true, .acq_rel)) return false;
     defer @atomicStore(bool, &controller.recovering, false, .release);
     if (controller.shutting_down or controller.phase == .stopped) return false;
@@ -1536,6 +1689,7 @@ fn recoverController(
                 if (port == trigger_port) trigger_result else r4os.abi.storage_request_result_reset,
                 r4os.abi.storage_request_result_reset,
             );
+            if (@atomicLoad(bool, &controller.cleanup_retained, .acquire)) return false;
         }
     }
 
@@ -1594,8 +1748,9 @@ fn comReset(controller: *ControllerState, port: *PortState) bool {
     writePort32(controller, base, PORT_SCTL, sctl);
     const start = ctx.tickCount();
     const timeout = ahci_state.ticksFromMilliseconds(controller.timer_hz, INIT_TIMEOUT_MS);
+    var poll = r4os.driver_poll_budget.DriverPollBudget.initIterations(1_000_000, .task);
     while (!ahci_state.linkReady(readPort32(controller, base, PORT_SSTS))) {
-        if (ahci_state.deadlineExpired(start, timeout, ctx.tickCount())) return false;
+        if ((poll.step(null, false) != .proceed or ahci_state.deadlineExpired(start, timeout, ctx.tickCount()))) return false;
         ctx.waitTicks(1);
     }
     clearPortStatus(controller, port);
@@ -1606,6 +1761,7 @@ fn waitForPreparingPort(controller: *ControllerState, port: *PortState) bool {
     const ctx = controllerContext(controller);
     const start = ctx.tickCount();
     const timeout = ahci_state.ticksFromMilliseconds(controller.timer_hz, INIT_TIMEOUT_MS);
+    var poll = r4os.driver_poll_budget.DriverPollBudget.initIterations(1_000_000, .task);
     while (true) {
         var preparing = false;
         if (!acquireController(controller)) return false;
@@ -1614,7 +1770,7 @@ fn waitForPreparingPort(controller: *ControllerState, port: *PortState) bool {
         }
         releaseController(controller);
         if (!preparing) return true;
-        if (ahci_state.deadlineExpired(start, timeout, ctx.tickCount())) return false;
+        if ((poll.step(null, false) != .proceed or ahci_state.deadlineExpired(start, timeout, ctx.tickCount()))) return false;
         ctx.waitTicks(1);
     }
 }
@@ -1672,8 +1828,8 @@ fn syncIo(
     defer @atomicStore(bool, &controller.sync_busy, false, .release);
     if (!validateTransfer(port, operation, lba, sectors, buffer_bytes, buffer_addr)) return -3;
     const ctx = controllerContext(controller);
-    const buffer = if (operation == r4os.abi.storage_request_op_flush) null else r4os.r4dev.SharedDmaBuffer.create(&ctx, buffer_bytes, if (controller.supports_64bit) std.math.maxInt(u64) else std.math.maxInt(u32)) orelse return -3;
-    defer if (buffer) |owned| owned.release(&ctx);
+    const buffer = if (operation == r4os.abi.storage_request_op_flush) null else ctx.createSharedDmaBuffer(buffer_bytes, if (controller.supports_64bit) std.math.maxInt(u64) else std.math.maxInt(u32)) orelse return -3;
+    defer if (buffer) |owned| ctx.releaseSharedDmaBuffer(owned);
     if (operation == r4os.abi.storage_request_op_write) {
         const source: [*]const u8 = @ptrFromInt(buffer_addr);
         @memcpy(buffer.?.data(), source[0..buffer_bytes]);
@@ -1746,7 +1902,7 @@ fn finishSyncClaim(controller: *ControllerState, handle: u64) void {
     }
 }
 
-fn shutdownAllControllers(ctx: *const r4os.r4dev.DriverContext) bool {
+fn shutdownAllControllers(ctx: *const r4os.r4dev.DriverContext2) bool {
     for (ports[0..port_count]) |*port| @atomicStore(bool, &port.accepting, false, .release);
     var safe = true;
     var index = controller_count;
@@ -1757,7 +1913,7 @@ fn shutdownAllControllers(ctx: *const r4os.r4dev.DriverContext) bool {
     return safe;
 }
 
-fn shutdownController(controller: *ControllerState, ctx: *const r4os.r4dev.DriverContext) bool {
+fn shutdownController(controller: *ControllerState, ctx: *const r4os.r4dev.DriverContext2) bool {
     if (controller.shutdown_done) return controller.shutdown_safe;
     for (controller.port_indices[0..controller.port_count]) |port_index| {
         const port = &ports[port_index];
@@ -1806,7 +1962,8 @@ fn shutdownController(controller: *ControllerState, ctx: *const r4os.r4dev.Drive
     }
     const irq_safe = unregisterInterrupts(controller, ctx);
     const bus_master_safe = disablePciBusMaster(controller, ctx);
-    const safe = stopped and work_safe and irq_safe and bus_master_safe;
+    const safe = stopped and work_safe and irq_safe and bus_master_safe and
+        !@atomicLoad(bool, &controller.cleanup_retained, .acquire);
     if (safe) {
         for (controller.port_indices[0..controller.port_count]) |port_index| {
             const port = &ports[port_index];
@@ -1823,7 +1980,7 @@ fn shutdownController(controller: *ControllerState, ctx: *const r4os.r4dev.Drive
     return safe;
 }
 
-fn releaseDriverWork(controller: *ControllerState, ctx: *const r4os.r4dev.DriverContext) bool {
+fn releaseDriverWork(controller: *ControllerState, ctx: *const r4os.r4dev.DriverContext2) bool {
     @atomicStore(bool, &controller.work_pending, false, .release);
     var safe = true;
     for (&controller.work_handles) |*stored| {
@@ -1848,7 +2005,7 @@ fn releaseDriverWork(controller: *ControllerState, ctx: *const r4os.r4dev.Driver
     return safe;
 }
 
-fn unregisterInterrupts(controller: *ControllerState, ctx: *const r4os.r4dev.DriverContext) bool {
+fn unregisterInterrupts(controller: *ControllerState, ctx: *const r4os.r4dev.DriverContext2) bool {
     const used_msi = controller.irq_mode == 2;
     var remaining: usize = 0;
     for (controller.irq_routes[0..controller.irq_route_count]) |route| {
@@ -1867,7 +2024,7 @@ fn unregisterInterrupts(controller: *ControllerState, ctx: *const r4os.r4dev.Dri
     return true;
 }
 
-fn disablePciBusMaster(controller: *ControllerState, ctx: *const r4os.r4dev.DriverContext) bool {
+fn disablePciBusMaster(controller: *ControllerState, ctx: *const r4os.r4dev.DriverContext2) bool {
     if (!controller.present) return true;
     const raw = ctx.pciReadConfig32(controller.info, 0x04);
     if (raw == 0xFFFF_FFFF) return false;
@@ -1908,8 +2065,8 @@ fn controllerForPort(port: *const PortState) ?*ControllerState {
     return controller;
 }
 
-fn controllerContext(controller: *const ControllerState) r4os.r4dev.DriverContext {
-    return r4os.r4dev.DriverContext.init(controller.api.?);
+fn controllerContext(controller: *const ControllerState) r4os.r4dev.DriverContext2 {
+    return r4os.r4dev.DriverContext2.init(controller.api.?);
 }
 
 fn acquireController(controller: *ControllerState) bool {
@@ -1938,8 +2095,9 @@ fn waitControllerClear(controller: *ControllerState, offset: u64, mask: u32, mil
     const ctx = controllerContext(controller);
     const start = ctx.tickCount();
     const timeout = ahci_state.ticksFromMilliseconds(controller.timer_hz, milliseconds);
+    var poll = r4os.driver_poll_budget.DriverPollBudget.initIterations(1_000_000, .task);
     while ((read32(controller, offset) & mask) != 0) {
-        if (ahci_state.deadlineExpired(start, timeout, ctx.tickCount())) return false;
+        if ((poll.step(null, false) != .proceed or ahci_state.deadlineExpired(start, timeout, ctx.tickCount()))) return false;
         ctx.waitTicks(1);
     }
     return true;
@@ -1949,8 +2107,9 @@ fn waitPortClear(controller: *ControllerState, base: u64, offset: u64, mask: u32
     const ctx = controllerContext(controller);
     const start = ctx.tickCount();
     const timeout = ahci_state.ticksFromMilliseconds(controller.timer_hz, milliseconds);
+    var poll = r4os.driver_poll_budget.DriverPollBudget.initIterations(1_000_000, .task);
     while ((readPort32(controller, base, offset) & mask) != 0) {
-        if (ahci_state.deadlineExpired(start, timeout, ctx.tickCount())) return false;
+        if ((poll.step(null, false) != .proceed or ahci_state.deadlineExpired(start, timeout, ctx.tickCount()))) return false;
         ctx.waitTicks(1);
     }
     return true;
@@ -1960,10 +2119,11 @@ fn waitPortReady(controller: *ControllerState, base: u64, milliseconds: u64) boo
     const ctx = controllerContext(controller);
     const start = ctx.tickCount();
     const timeout = ahci_state.ticksFromMilliseconds(controller.timer_hz, milliseconds);
+    var poll = r4os.driver_poll_budget.DriverPollBudget.initIterations(1_000_000, .task);
     while (true) {
         const tfd = readPort32(controller, base, PORT_TFD);
         if ((tfd & (ahci_state.tfd_bsy | ahci_state.tfd_drq)) == 0) return (tfd & ahci_state.tfd_err) == 0;
-        if (ahci_state.deadlineExpired(start, timeout, ctx.tickCount())) return false;
+        if ((poll.step(null, false) != .proceed or ahci_state.deadlineExpired(start, timeout, ctx.tickCount()))) return false;
         ctx.waitTicks(1);
     }
 }
