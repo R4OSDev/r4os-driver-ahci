@@ -232,7 +232,8 @@ var inventory_complete: bool = true;
 var next_sync_sequence: u64 = 1;
 
 comptime {
-    asm (r4os.technical2.driverEntriesAsm("ahci_init", "ahci_shutdown"));
+    if (!@import("builtin").is_test)
+        asm (r4os.technical2.driverEntriesAsm("ahci_init", "ahci_shutdown"));
 }
 
 // These cases invoke the real finish path with only its actual DriverApi2
